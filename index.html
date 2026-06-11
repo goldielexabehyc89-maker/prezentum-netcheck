@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Диагностика связи · Prezentum</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:#0b0b0b; color:#eee; font:15px/1.5 -apple-system,Segoe UI,Roboto,sans-serif; padding:20px; }
+  .wrap { max-width:820px; margin:0 auto; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  p.sub { color:#9a9a9a; margin:0 0 18px; }
+  button { background:#F0E100; color:#000; border:0; border-radius:10px; padding:12px 20px; font-size:15px; font-weight:600; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  button.sec { background:#242424; color:#eee; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-bottom:16px; }
+  table { width:100%; border-collapse:collapse; margin:14px 0; font-size:14px; }
+  th,td { text-align:left; padding:8px 10px; border-bottom:1px solid #222; }
+  th { color:#9a9a9a; font-weight:500; }
+  td.ok { color:#4ade80; } td.bad { color:#f87171; }
+  .bar { height:8px; background:#1a1a1a; border-radius:6px; overflow:hidden; margin:10px 0; }
+  .bar > i { display:block; height:100%; width:0; background:#F0E100; transition:width .2s; }
+  #verdict { padding:14px 16px; border-radius:12px; background:#141414; border:1px solid #242424; margin:16px 0; display:none; }
+  #verdict.show { display:block; }
+  textarea { width:100%; height:200px; background:#111; color:#cfcfcf; border:1px solid #242424; border-radius:10px; padding:10px; font:12px/1.4 monospace; margin-top:8px; }
+  .muted { color:#777; font-size:12px; }
+  .net { font-size:12px; color:#9a9a9a; margin-bottom:8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Диагностика связи с Prezentum</h1>
+  <p class="sub">Запусти тест на КАЖДОЙ сети, где бывает проблема (включая ту, где сайт не открывается — эта страница работает и там). Затем «Скопировать отчёт» и пришли его.</p>
+  <div class="net" id="net"></div>
+  <div class="row">
+    <button id="run">▶ Запустить тест</button>
+    <button id="copy" class="sec" disabled>📋 Скопировать отчёт</button>
+    <span id="state" class="muted"></span>
+  </div>
+  <div class="bar"><i id="prog"></i></div>
+  <table id="tbl">
+    <thead><tr><th>Цель</th><th>Успешно</th><th>Сбой/таймаут</th><th>Задержка (мс)</th></tr></thead>
+    <tbody></tbody>
+  </table>
+  <div id="verdict"></div>
+  <textarea id="report" readonly placeholder="Отчёт появится здесь после теста..."></textarea>
+  <p class="muted">Тест шлёт короткие запросы к Prezentum и к контрольным узлам (Cloudflare CDN, 1.1.1.1, Google) и считает, что доходит и как быстро. Данные никуда не отправляются автоматически.</p>
+</div>
+<script>
+const PREZ = 'https://prezentum.roseone.ru';
+const SAME = location.origin === PREZ; // на самом prezentum — cors; на нейтральном хосте — no-cors (мерим только доходимость)
+const ROUNDS = 15, TIMEOUT = 8000, GAP = 250;
+const TARGETS = [
+  { key:'ping',   label:'Prezentum · /api/ping (мелкий)',     url:PREZ+'/api/ping',                  same:SAME  },
+  { key:'api',    label:'Prezentum · /api/price-options',     url:PREZ+'/api/price-options',         same:SAME  },
+  { key:'index',  label:'Prezentum · страница /',             url:PREZ+'/',                          same:SAME  },
+  { key:'big',    label:'Prezentum · крупный файл (~89КБ)',   url:PREZ+'/design-system-light.html',  same:SAME  },
+  { key:'cf',     label:'Cloudflare CDN (cdnjs)',             url:'https://cdnjs.cloudflare.com/ajax/libs/jquery/3.7.1/jquery.min.js', same:false },
+  { key:'cf2',    label:'Cloudflare 1.1.1.1',                 url:'https://1.1.1.1/cdn-cgi/trace',   same:false },
+  { key:'google', label:'Google (общий интернет)',            url:'https://www.google.com/generate_204', same:false },
+];
+const stats = {};
+TARGETS.forEach(t => stats[t.key] = { ok:0, fail:0, ms:[] });
+
+document.getElementById('net').textContent = 'Хост страницы: ' + location.origin + (SAME ? ' (это сам Prezentum)' : ' (нейтральный — работает даже если Prezentum заблокирован)');
+const tbody = document.querySelector('#tbl tbody');
+const rowEls = {};
+TARGETS.forEach(t => {
+  const tr = document.createElement('tr');
+  tr.innerHTML = `<td>${t.label}</td><td class="ok">0</td><td class="bad">0</td><td>—</td>`;
+  tbody.appendChild(tr); rowEls[t.key] = tr;
+});
+const pct = (arr,p) => { if(!arr.length) return null; const s=[...arr].sort((a,b)=>a-b); return s[Math.min(s.length-1, Math.floor(s.length*p))]; };
+function renderRow(t){
+  const s = stats[t.key], tr = rowEls[t.key];
+  tr.children[1].textContent = s.ok;
+  tr.children[2].textContent = s.fail;
+  tr.children[2].className = s.fail>0 ? 'bad' : '';
+  tr.children[3].textContent = s.ms.length ? `p50 ${pct(s.ms,.5)} · p95 ${pct(s.ms,.95)}` : '—';
+}
+async function probe(t, round){
+  const ctrl = new AbortController();
+  const tm = setTimeout(()=>ctrl.abort(), TIMEOUT);
+  const url = t.url + (t.url.includes('?')?'&':'?') + '_=' + Date.now() + '_' + round;
+  const t0 = performance.now();
+  try {
+    await fetch(url, { signal: ctrl.signal, cache:'no-store', mode: t.same ? 'cors' : 'no-cors', credentials:'omit' });
+    stats[t.key].ok++; stats[t.key].ms.push(Math.round(performance.now()-t0));
+  } catch(e){ stats[t.key].fail++; }
+  finally { clearTimeout(tm); renderRow(t); }
+}
+function meta(){
+  const c = navigator.connection || {};
+  return { when:new Date().toISOString(), host:location.origin, tz:Intl.DateTimeFormat().resolvedOptions().timeZone, ua:navigator.userAgent, lang:navigator.language, online:navigator.onLine, conn:{ type:c.type, effectiveType:c.effectiveType, rtt:c.rtt, downlink:c.downlink }, screen:`${screen.width}x${screen.height}` };
+}
+function buildReport(){
+  const res = {};
+  TARGETS.forEach(t => { const s=stats[t.key]; res[t.key]={ label:t.label, ok:s.ok, fail:s.fail, total:s.ok+s.fail, p50:pct(s.ms,.5), p95:pct(s.ms,.95), max:s.ms.length?Math.max(...s.ms):null }; });
+  return { meta:meta(), rounds:ROUNDS, timeoutMs:TIMEOUT, results:res };
+}
+function verdict(rep){
+  const own=['ping','api','index','big'].map(k=>rep.results[k]);
+  const ownOk=own.reduce((a,r)=>a+r.ok,0), ownTot=own.reduce((a,r)=>a+r.total,0), ownRate=ownTot?Math.round(ownOk/ownTot*100):0;
+  const cfOk=rep.results.cf.ok+rep.results.cf2.ok, cfTot=rep.results.cf.total+rep.results.cf2.total, cfRate=cfTot?Math.round(cfOk/cfTot*100):0;
+  const gRate=rep.results.google.total?Math.round(rep.results.google.ok/rep.results.google.total*100):0;
+  let msg,cls='warn';
+  if (ownRate>=98){ msg=`✅ Prezentum доходит стабильно (${ownRate}%). На этой сети всё ок — запусти ещё на «сломанной» сети.`; cls='ok'; }
+  else if (ownRate<90 && cfRate>=90){ msg=`⚠️ Prezentum доходит лишь ${ownRate}%, а Cloudflare ${cfRate}% — провайдер режет именно prezentum.roseone.ru → Cloudflare ДОЛЖЕН помочь.`; cls='bad'; }
+  else if (ownRate<90 && cfRate<50 && gRate>=90){ msg=`⚠️ Prezentum ${ownRate}%, Cloudflare ${cfRate}%, Google ${gRate}% — режется и наш домен, и Cloudflare. Cloudflare может НЕ помочь на этой сети.`; cls='bad'; }
+  else if (ownRate<90 && gRate<90){ msg=`⚠️ Нестабильно всё (Prezentum ${ownRate}%, Google ${gRate}%) — проблема в самой сети/VPN, не в сайте.`; cls='bad'; }
+  else { msg=`⚠️ Prezentum ${ownRate}%, Cloudflare ${cfRate}%, Google ${gRate}%. Пришли отчёт — разберём.`; }
+  const v=document.getElementById('verdict'); v.className='show'; v.style.borderColor=cls==='ok'?'#1f3d28':cls==='bad'?'#3d1f1f':'#3d361f'; v.textContent=msg;
+}
+document.getElementById('run').onclick = async () => {
+  const btn=document.getElementById('run'); btn.disabled=true; document.getElementById('copy').disabled=true;
+  const st=document.getElementById('state'), prog=document.getElementById('prog');
+  TARGETS.forEach(t=>{ stats[t.key]={ok:0,fail:0,ms:[]}; renderRow(t); });
+  const total=ROUNDS*TARGETS.length; let done=0;
+  for (let r=0;r<ROUNDS;r++){
+    for (const t of TARGETS){ await probe(t,r); done++; prog.style.width=(done/total*100)+'%'; st.textContent=`Раунд ${r+1}/${ROUNDS}...`; }
+    await new Promise(res=>setTimeout(res,GAP));
+  }
+  const rep=buildReport();
+  const human='ОТЧЁТ ДИАГНОСТИКИ PREZENTUM\n'+rep.meta.when+' · хост: '+rep.meta.host+'\n'+
+    TARGETS.map(t=>{const x=rep.results[t.key];return `${t.label}: ${x.ok}/${x.total} ok, сбоев ${x.fail}, p50 ${x.p50??'-'}мс, p95 ${x.p95??'-'}мс`;}).join('\n');
+  document.getElementById('report').value=human+'\n\n--- JSON ---\n'+JSON.stringify(rep,null,2);
+  st.textContent='Готово. Нажми «Скопировать отчёт» и пришли его.';
+  btn.disabled=false; document.getElementById('copy').disabled=false; verdict(rep);
+};
+document.getElementById('copy').onclick = async () => {
+  const ta=document.getElementById('report'); ta.select();
+  try { await navigator.clipboard.writeText(ta.value); document.getElementById('state').textContent='Скопировано ✓ — пришли в Telegram/почту.'; }
+  catch { document.execCommand('copy'); document.getElementById('state').textContent='Выделено — скопируй вручную (Ctrl/Cmd+C).'; }
+};
+</script>
+</body>
+</html>
